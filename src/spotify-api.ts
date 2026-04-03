@@ -1,4 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import { dirname, resolve } from "node:path";
 
 type JsonValue =
   | string
@@ -16,6 +19,7 @@ export type SpotifyConfig = {
   accessTokenExpiresAt?: string;
   tokenScopes?: string;
   defaultRedirectUri: string;
+  tokenStorePath?: string;
 };
 
 type TokenState = {
@@ -23,7 +27,14 @@ type TokenState = {
   refreshToken?: string;
   expiresAt?: number;
   scopes?: string[];
-  source: "env" | "manual" | "pkce" | "refresh" | "client_credentials";
+  source:
+    | "env"
+    | "manual"
+    | "pkce"
+    | "refresh"
+    | "client_credentials"
+    | "authorization_code"
+    | "store";
 };
 
 type PkceSession = {
@@ -43,10 +54,29 @@ type SpotifyRequest = {
   requiredScopes?: string[];
 };
 
+type PersistedUserToken = {
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: number;
+  scopes?: string[];
+  updatedAt: string;
+};
+
+type LocalAuthSession = {
+  authorizationUrl: string;
+  redirectUri: string;
+  scopes: string[];
+  state: string;
+  startedAt: number;
+  server: Server;
+  completion: Promise<Record<string, unknown>>;
+};
+
 export class SpotifyApiClient {
   private readonly config: SpotifyConfig;
   private readonly availableScopes: string[];
   private readonly pkceSessions = new Map<string, PkceSession>();
+  private localAuthSession?: LocalAuthSession;
   private userToken?: TokenState;
   private appToken?: TokenState;
 
@@ -80,8 +110,150 @@ export class SpotifyApiClient {
               : null,
           }
         : null,
+      tokenStorePath: this.getTokenStorePath(),
       pendingPkceSessions: this.pkceSessions.size,
+      pendingLocalAuth: this.localAuthSession
+        ? {
+            redirectUri: this.localAuthSession.redirectUri,
+            scopes: this.localAuthSession.scopes,
+            state: this.localAuthSession.state,
+            startedAt: new Date(this.localAuthSession.startedAt).toISOString(),
+          }
+        : null,
     };
+  }
+
+  async beginUserAuth(input: {
+    redirectUri?: string;
+    scopes?: string[];
+    state?: string;
+    showDialog?: boolean;
+  }): Promise<Record<string, unknown>> {
+    if (!this.config.clientId || !this.config.clientSecret) {
+      throw new Error(
+        "SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET are required to start local user auth.",
+      );
+    }
+
+    if (this.localAuthSession) {
+      return {
+        authorizationUrl: this.localAuthSession.authorizationUrl,
+        redirectUri: this.localAuthSession.redirectUri,
+        scopes: this.localAuthSession.scopes,
+        state: this.localAuthSession.state,
+        startedAt: new Date(this.localAuthSession.startedAt).toISOString(),
+        status: "pending",
+      };
+    }
+
+    const redirectUri = input.redirectUri ?? this.config.defaultRedirectUri;
+    const redirectUrl = parseLoopbackRedirectUri(redirectUri);
+    const scopes =
+      input.scopes && input.scopes.length > 0 ? input.scopes : this.availableScopes;
+    const state = input.state ?? randomBytes(12).toString("hex");
+    const authorizationUrl = new URL("https://accounts.spotify.com/authorize");
+
+    authorizationUrl.searchParams.set("response_type", "code");
+    authorizationUrl.searchParams.set("client_id", this.config.clientId);
+    authorizationUrl.searchParams.set("redirect_uri", redirectUri);
+    authorizationUrl.searchParams.set("scope", scopes.join(" "));
+    authorizationUrl.searchParams.set("state", state);
+
+    if (input.showDialog === true) {
+      authorizationUrl.searchParams.set("show_dialog", "true");
+    }
+
+    let resolveCompletion!: (value: Record<string, unknown>) => void;
+    let rejectCompletion!: (reason?: unknown) => void;
+    const completion = new Promise<Record<string, unknown>>((resolve, reject) => {
+      resolveCompletion = resolve;
+      rejectCompletion = reject;
+    });
+    completion.catch(() => undefined);
+    const server = createServer((request, response) => {
+      void this.handleLocalAuthCallback({
+        requestUrl: request.url ?? "/",
+        redirectUri,
+        expectedPath: redirectUrl.pathname,
+        expectedState: state,
+        respond: (statusCode, body) => {
+          response.statusCode = statusCode;
+          response.setHeader("Content-Type", "text/html; charset=utf-8");
+          response.end(body);
+        },
+        resolveCompletion,
+        rejectCompletion,
+      });
+    });
+
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      server.once("error", rejectPromise);
+      server.listen(Number(redirectUrl.port), redirectUrl.hostname, () => {
+        server.off("error", rejectPromise);
+        resolvePromise();
+      });
+    });
+
+    this.localAuthSession = {
+      authorizationUrl: authorizationUrl.toString(),
+      redirectUri,
+      scopes,
+      state,
+      startedAt: Date.now(),
+      server,
+      completion,
+    };
+
+    return {
+      authorizationUrl: authorizationUrl.toString(),
+      redirectUri,
+      scopes,
+      state,
+      status: "pending",
+      instructions:
+        "Open the authorizationUrl in your browser, approve the app, and wait for Spotify to redirect back to the local callback URL.",
+    };
+  }
+
+  async awaitUserAuth(input?: {
+    timeoutMs?: number;
+  }): Promise<Record<string, unknown>> {
+    if (!this.localAuthSession) {
+      if (this.userToken) {
+        return {
+          status: "authenticated",
+          userToken: {
+            source: this.userToken.source,
+            hasRefreshToken: Boolean(this.userToken.refreshToken),
+            expiresAt: this.userToken.expiresAt
+              ? new Date(this.userToken.expiresAt).toISOString()
+              : null,
+            scopes: this.userToken.scopes ?? null,
+          },
+        };
+      }
+
+      throw new Error("No local user auth session is pending.");
+    }
+
+    const timeoutMs = clampTimeoutMs(input?.timeoutMs);
+
+    const timed = await Promise.race([
+      this.localAuthSession.completion,
+      new Promise<Record<string, unknown>>((resolve) => {
+        setTimeout(() => {
+          const session = this.localAuthSession;
+          resolve({
+            status: "pending",
+            redirectUri: session?.redirectUri ?? null,
+            scopes: session?.scopes ?? null,
+            state: session?.state ?? null,
+          });
+        }, timeoutMs);
+      }),
+    ]);
+
+    return timed;
   }
 
   beginPkceAuth(input: {
@@ -178,6 +350,7 @@ export class SpotifyApiClient {
           : session.scopes,
       source: "pkce",
     };
+    this.persistUserToken(this.userToken);
 
     this.pkceSessions.delete(input.sessionId);
 
@@ -207,6 +380,7 @@ export class SpotifyApiClient {
       scopes: input.scopes,
       source: "manual",
     };
+    this.persistUserToken(this.userToken);
 
     return this.getAuthStatus();
   }
@@ -306,7 +480,7 @@ export class SpotifyApiClient {
     }
 
     throw new Error(
-      "No Spotify credentials are configured. Set env vars or use spotify.begin-pkce-auth.",
+      "No Spotify credentials are configured. Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET, or complete an auth flow such as spotify.begin-user-auth.",
     );
   }
 
@@ -322,7 +496,7 @@ export class SpotifyApiClient {
         };
       } else {
         throw new Error(
-          "A user token is required for this endpoint. Configure a refresh token or complete PKCE auth.",
+          "A user token is required for this endpoint. Start spotify.begin-user-auth or configure a refresh token.",
         );
       }
     }
@@ -442,7 +616,7 @@ export class SpotifyApiClient {
       throw new Error(`Failed to refresh user token: ${formatErrorPayload(payload)}`);
     }
 
-    return {
+    const refreshedToken: TokenState = {
       accessToken: String(payload.access_token),
       refreshToken:
         typeof payload.refresh_token === "string"
@@ -458,19 +632,32 @@ export class SpotifyApiClient {
           : currentToken.scopes,
       source: "refresh",
     };
+    this.persistUserToken(refreshedToken);
+
+    return refreshedToken;
   }
 
   private createInitialUserToken(): TokenState | undefined {
-    if (!this.config.accessToken && !this.config.refreshToken) {
+    const persistedToken = this.readPersistedUserToken();
+    const accessToken = this.config.accessToken ?? persistedToken?.accessToken;
+    const refreshToken = this.config.refreshToken ?? persistedToken?.refreshToken;
+    const expiresAt =
+      parseExpiresAt(this.config.accessTokenExpiresAt) ?? persistedToken?.expiresAt;
+    const scopes = parseScopes(this.config.tokenScopes) ?? persistedToken?.scopes;
+
+    if (!accessToken && !refreshToken) {
       return undefined;
     }
 
     return {
-      accessToken: this.config.accessToken ?? "",
-      refreshToken: this.config.refreshToken,
-      expiresAt: parseExpiresAt(this.config.accessTokenExpiresAt),
-      scopes: parseScopes(this.config.tokenScopes),
-      source: "env",
+      accessToken: accessToken ?? "",
+      refreshToken,
+      expiresAt,
+      scopes,
+      source:
+        this.config.accessToken !== undefined || this.config.refreshToken !== undefined
+          ? "env"
+          : "store",
     };
   }
 
@@ -484,6 +671,231 @@ export class SpotifyApiClient {
     }
 
     return Date.now() >= token.expiresAt - 60_000;
+  }
+
+  private async handleLocalAuthCallback(input: {
+    requestUrl: string;
+    redirectUri: string;
+    expectedPath: string;
+    expectedState: string;
+    respond: (statusCode: number, body: string) => void;
+    resolveCompletion: (value: Record<string, unknown>) => void;
+    rejectCompletion: (reason?: unknown) => void;
+  }): Promise<void> {
+    const requestUrl = new URL(input.requestUrl, input.redirectUri);
+
+    if (requestUrl.pathname !== input.expectedPath) {
+      input.respond(404, renderHtmlResponse("Not found", "Unknown callback path."));
+      return;
+    }
+
+    const error = requestUrl.searchParams.get("error");
+    const state = requestUrl.searchParams.get("state");
+    const code = requestUrl.searchParams.get("code");
+
+    if (error) {
+      const failure = new Error(`Spotify authorization failed: ${error}`);
+      input.respond(
+        400,
+        renderHtmlResponse("Authorization failed", `Spotify returned: ${error}`),
+      );
+      this.finishLocalAuthSession();
+      input.rejectCompletion(failure);
+      return;
+    }
+
+    if (!code) {
+      const failure = new Error("Spotify authorization callback did not include a code.");
+      input.respond(
+        400,
+        renderHtmlResponse("Authorization failed", "Spotify did not return a code."),
+      );
+      this.finishLocalAuthSession();
+      input.rejectCompletion(failure);
+      return;
+    }
+
+    if (state !== input.expectedState) {
+      const failure = new Error("Spotify authorization state mismatch.");
+      input.respond(
+        400,
+        renderHtmlResponse(
+          "Authorization failed",
+          "The returned state value did not match the expected request.",
+        ),
+      );
+      this.finishLocalAuthSession();
+      input.rejectCompletion(failure);
+      return;
+    }
+
+    try {
+      const token = await this.exchangeAuthorizationCode({
+        code,
+        redirectUri: input.redirectUri,
+      });
+
+      this.userToken = token;
+      this.persistUserToken(token);
+      input.respond(
+        200,
+        renderHtmlResponse(
+          "Spotify connected",
+          "Authorization completed successfully. You can close this tab.",
+        ),
+      );
+      input.resolveCompletion({
+        status: "authenticated",
+        source: token.source,
+        hasRefreshToken: Boolean(token.refreshToken),
+        accessTokenExpiresAt: token.expiresAt
+          ? new Date(token.expiresAt).toISOString()
+          : null,
+        scopes: token.scopes ?? null,
+        tokenStorePath: this.getTokenStorePath(),
+      });
+    } catch (error) {
+      input.respond(
+        500,
+        renderHtmlResponse(
+          "Authorization failed",
+          error instanceof Error ? error.message : "Unknown error",
+        ),
+      );
+      input.rejectCompletion(error);
+    } finally {
+      this.finishLocalAuthSession();
+    }
+  }
+
+  private async exchangeAuthorizationCode(input: {
+    code: string;
+    redirectUri: string;
+  }): Promise<TokenState> {
+    const response = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${Buffer.from(
+          `${this.config.clientId}:${this.config.clientSecret}`,
+        ).toString("base64")}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: input.code,
+        redirect_uri: input.redirectUri,
+      }),
+    });
+    const payload = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        `Failed to exchange authorization code: ${formatErrorPayload(payload)}`,
+      );
+    }
+
+    return {
+      accessToken: String(payload.access_token),
+      refreshToken:
+        typeof payload.refresh_token === "string" ? payload.refresh_token : undefined,
+      expiresAt:
+        typeof payload.expires_in === "number"
+          ? Date.now() + payload.expires_in * 1000
+          : undefined,
+      scopes:
+        typeof payload.scope === "string"
+          ? payload.scope.split(/\s+/).filter(Boolean)
+          : undefined,
+      source: "authorization_code",
+    };
+  }
+
+  private finishLocalAuthSession(): void {
+    const session = this.localAuthSession;
+
+    this.localAuthSession = undefined;
+    session?.server.close();
+  }
+
+  private readPersistedUserToken(): PersistedUserToken | undefined {
+    const tokenStorePath = this.getTokenStorePath();
+
+    if (!tokenStorePath || !existsSync(tokenStorePath)) {
+      return undefined;
+    }
+
+    try {
+      const parsed = JSON.parse(readFileSync(tokenStorePath, "utf8")) as Partial<PersistedUserToken>;
+
+      if (typeof parsed.accessToken !== "string" || parsed.accessToken.length === 0) {
+        if (typeof parsed.refreshToken === "string" && parsed.refreshToken.length > 0) {
+          return {
+            accessToken: "",
+            refreshToken: parsed.refreshToken,
+            expiresAt:
+              typeof parsed.expiresAt === "number" ? parsed.expiresAt : undefined,
+            scopes: Array.isArray(parsed.scopes)
+              ? parsed.scopes.filter((scope): scope is string => typeof scope === "string")
+              : undefined,
+            updatedAt:
+              typeof parsed.updatedAt === "string"
+                ? parsed.updatedAt
+                : new Date(0).toISOString(),
+          };
+        }
+
+        return undefined;
+      }
+
+      return {
+        accessToken: parsed.accessToken,
+        refreshToken:
+          typeof parsed.refreshToken === "string" ? parsed.refreshToken : undefined,
+        expiresAt: typeof parsed.expiresAt === "number" ? parsed.expiresAt : undefined,
+        scopes: Array.isArray(parsed.scopes)
+          ? parsed.scopes.filter((scope): scope is string => typeof scope === "string")
+          : undefined,
+        updatedAt:
+          typeof parsed.updatedAt === "string"
+            ? parsed.updatedAt
+            : new Date(0).toISOString(),
+      };
+    } catch (error) {
+      throw new Error(
+        `Failed to read Spotify token store at ${tokenStorePath}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  private persistUserToken(token: TokenState): void {
+    const tokenStorePath = this.getTokenStorePath();
+
+    if (!tokenStorePath) {
+      return;
+    }
+
+    mkdirSync(dirname(tokenStorePath), { recursive: true });
+    writeFileSync(
+      tokenStorePath,
+      JSON.stringify(
+        {
+          accessToken: token.accessToken,
+          refreshToken: token.refreshToken,
+          expiresAt: token.expiresAt,
+          scopes: token.scopes,
+          updatedAt: new Date().toISOString(),
+        } satisfies PersistedUserToken,
+        null,
+        2,
+      ),
+      "utf8",
+    );
+  }
+
+  private getTokenStorePath(): string | undefined {
+    return this.config.tokenStorePath
+      ? resolve(this.config.tokenStorePath)
+      : undefined;
   }
 }
 
@@ -560,6 +972,68 @@ function parseScopes(value?: string): string[] | undefined {
     .filter(Boolean);
 
   return scopes.length > 0 ? scopes : undefined;
+}
+
+function parseLoopbackRedirectUri(redirectUri: string): URL {
+  const url = new URL(redirectUri);
+  const validHosts = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+
+  if (url.protocol !== "http:") {
+    throw new Error("Local user auth requires an http:// localhost redirect URI.");
+  }
+
+  if (!validHosts.has(url.hostname)) {
+    throw new Error(
+      "Local user auth requires a loopback redirect URI such as http://127.0.0.1:8888/callback.",
+    );
+  }
+
+  if (!url.port) {
+    throw new Error("Local user auth requires an explicit port in the redirect URI.");
+  }
+
+  return url;
+}
+
+function renderHtmlResponse(title: string, message: string): string {
+  return [
+    "<!doctype html>",
+    "<html>",
+    "<head>",
+    '<meta charset="utf-8">',
+    `<title>${escapeHtml(title)}</title>`,
+    "<style>",
+    "body{font-family:system-ui,Segoe UI,sans-serif;max-width:42rem;margin:3rem auto;padding:0 1rem;line-height:1.5;color:#111827;background:#f9fafb;}",
+    "main{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:1.5rem 1.25rem;box-shadow:0 10px 25px rgba(0,0,0,.06);}",
+    "h1{margin-top:0;font-size:1.4rem;}",
+    "p{margin-bottom:0;}",
+    "</style>",
+    "</head>",
+    "<body>",
+    "<main>",
+    `<h1>${escapeHtml(title)}</h1>`,
+    `<p>${escapeHtml(message)}</p>`,
+    "</main>",
+    "</body>",
+    "</html>",
+  ].join("");
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function clampTimeoutMs(value?: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 120_000;
+  }
+
+  return Math.max(1_000, Math.min(Math.trunc(value), 600_000));
 }
 
 function formatErrorPayload(value: unknown): string {

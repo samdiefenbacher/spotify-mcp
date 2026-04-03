@@ -44,6 +44,8 @@ const spotify = new SpotifyApiClient(
     tokenScopes: process.env.SPOTIFY_TOKEN_SCOPES,
     defaultRedirectUri:
       process.env.SPOTIFY_DEFAULT_REDIRECT_URI ?? "http://127.0.0.1:8888/callback",
+    tokenStorePath:
+      process.env.SPOTIFY_TOKEN_STORE_PATH ?? ".spotify-tokens.json",
   },
   availableScopes,
 );
@@ -57,10 +59,40 @@ server.registerTool(
 );
 
 server.registerTool(
+  "spotify.begin-user-auth",
+  {
+    description:
+      "Start a localhost Spotify authorization-code flow using your client ID and client secret. The server exchanges the code automatically and stores the refresh token for future runs.",
+    inputSchema: z.object({
+      redirectUri: z.string().optional(),
+      scopes: z.array(z.string()).optional(),
+      state: z.string().optional(),
+      showDialog: z.boolean().optional(),
+    }),
+  },
+  async ({ redirectUri, scopes, state, showDialog }) =>
+    asTextResult(
+      await spotify.beginUserAuth({ redirectUri, scopes, state, showDialog }),
+    ),
+);
+
+server.registerTool(
+  "spotify.await-user-auth",
+  {
+    description:
+      "Wait for an in-progress localhost Spotify auth flow to complete, or report that it is still pending.",
+    inputSchema: z.object({
+      timeoutMs: z.number().int().min(1000).max(600000).optional(),
+    }),
+  },
+  async ({ timeoutMs }) => asTextResult(await spotify.awaitUserAuth({ timeoutMs })),
+);
+
+server.registerTool(
   "spotify.begin-pkce-auth",
   {
     description:
-      "Create a Spotify PKCE authorization URL. Open the returned URL, approve the app, then pass the code to spotify.complete-pkce-auth.",
+      "Create a Spotify PKCE authorization URL. This remains available as a manual fallback if you do not want to use the localhost secret-based auth flow.",
     inputSchema: z.object({
       redirectUri: z.string().optional(),
       scopes: z.array(z.string()).optional(),
@@ -89,7 +121,7 @@ server.registerTool(
   "spotify.set-user-tokens",
   {
     description:
-      "Inject Spotify access and optional refresh tokens into the running server. This only persists until restart.",
+      "Inject Spotify access and optional refresh tokens into the running server and persist them into the token store when configured.",
     inputSchema: z.object({
       accessToken: z.string(),
       refreshToken: z.string().optional(),
