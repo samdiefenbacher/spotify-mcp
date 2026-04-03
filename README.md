@@ -6,6 +6,7 @@ Spotify MCP server over stdio, with Docker support. The server loads Spotify's O
 
 - A stdio MCP server built on `@modelcontextprotocol/sdk`
 - Generated MCP tools for the Spotify Web API operations in the bundled schema snapshot
+- Curated playlist tools for common create, add, search, edit, remove, replace, and reorder workflows
 - Auth helpers for runtime token injection and PKCE bootstrap
 - A generic raw request tool for cases where you want to hit a path directly
 - A Docker image that runs the same stdio server
@@ -63,6 +64,74 @@ If you do not already have a refresh token configured:
 5. Persist the returned `refreshToken` into `SPOTIFY_REFRESH_TOKEN` for future runs
 
 Your Spotify app must allow the redirect URI you use, such as `http://127.0.0.1:8888/callback`.
+
+## Curated tools
+
+Playlist workflows:
+
+- `spotify.create-playlist`
+- `spotify.get-my-playlists`
+- `spotify.add-tracks`
+- `spotify.search-and-add`
+- `spotify.update-playlist-details`
+- `spotify.remove-tracks`
+- `spotify.replace-tracks`
+- `spotify.reorder-tracks`
+
+Player control:
+
+- `spotify.play`
+- `spotify.pause`
+- `spotify.next`
+- `spotify.previous`
+- `spotify.get-devices`
+- `spotify.transfer-playback`
+- `spotify.set-volume`
+- `spotify.seek`
+- `spotify.set-repeat`
+- `spotify.set-shuffle`
+- `spotify.get-queue`
+- `spotify.add-to-queue`
+- `spotify.now-playing`
+- `spotify.recently-played`
+
+Search, recommendations, and library:
+
+- `spotify.search-tracks`
+- `spotify.search-artists`
+- `spotify.search-albums`
+- `spotify.search-playlists`
+- `spotify.recommend-tracks`
+- `spotify.save-to-library`
+- `spotify.remove-from-library`
+- `spotify.check-library`
+- `spotify.get-liked-tracks`
+- `spotify.get-saved-albums`
+- `spotify.get-saved-shows`
+- `spotify.get-saved-audiobooks`
+
+Profile and discovery:
+
+- `spotify.get-me`
+- `spotify.get-top-tracks`
+- `spotify.get-top-artists`
+- `spotify.follow-artist`
+- `spotify.unfollow-artist`
+- `spotify.get-followed-artists`
+- `spotify.follow-playlist`
+- `spotify.unfollow-playlist`
+- `spotify.get-featured-playlists`
+- `spotify.get-new-releases`
+- `spotify.get-category-playlists`
+- `spotify.get-categories`
+- `spotify.get-artist`
+- `spotify.get-artist-top-tracks`
+- `spotify.get-related-artists`
+- `spotify.get-album`
+- `spotify.get-track`
+- `spotify.get-show`
+- `spotify.get-episode`
+- `spotify.get-audiobook`
 
 ## Notes
 
