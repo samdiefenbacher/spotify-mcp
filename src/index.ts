@@ -1,7 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
+import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import dotenv from "dotenv";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import * as z from "zod/v4";
 import { loadSpotifyOpenApi, OperationDefinition } from "./openapi.js";
 import { SpotifyApiClient } from "./spotify-api.js";
@@ -1903,11 +1905,90 @@ for (const operation of generatedOperations) {
 }
 
 async function main(): Promise<void> {
+  const transportMode = normalizeTransportMode(process.env.MCP_TRANSPORT);
+
+  if (transportMode === "http") {
+    await runHttpServer();
+    return;
+  }
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
     `spotify-mcp connected over stdio with ${operations.length} schema operations plus curated helpers.`,
   );
+}
+
+async function runHttpServer(): Promise<void> {
+  const host = process.env.MCP_HTTP_HOST?.trim() || "0.0.0.0";
+  const port = parseHttpPort(process.env.MCP_HTTP_PORT);
+  const mcpPath = normalizeHttpPath(process.env.MCP_HTTP_PATH);
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined,
+  });
+
+  await server.connect(transport);
+
+  const httpServer = createServer((request, response) => {
+    void handleHttpRequest({
+      request,
+      response,
+      transport,
+      mcpPath,
+    }).catch((error) => {
+      if (response.headersSent) {
+        response.destroy(error instanceof Error ? error : undefined);
+        return;
+      }
+
+      sendJson(response, 500, {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(port, host, () => {
+      httpServer.off("error", reject);
+      resolve();
+    });
+  });
+
+  console.error(
+    `spotify-mcp connected over Streamable HTTP at http://${host}:${port}${mcpPath} with ${operations.length} schema operations plus curated helpers.`,
+  );
+}
+
+async function handleHttpRequest(input: {
+  request: IncomingMessage;
+  response: ServerResponse<IncomingMessage>;
+  transport: StreamableHTTPServerTransport;
+  mcpPath: string;
+}): Promise<void> {
+  const requestUrl = new URL(
+    input.request.url ?? "/",
+    `http://${input.request.headers.host ?? "127.0.0.1"}`,
+  );
+
+  if (requestUrl.pathname === "/healthz") {
+    sendJson(input.response, 200, {
+      status: "ok",
+      transport: "http",
+      mcpPath: input.mcpPath,
+    });
+    return;
+  }
+
+  if (requestUrl.pathname !== input.mcpPath) {
+    sendJson(input.response, 404, {
+      error: "Not found",
+      mcpPath: input.mcpPath,
+    });
+    return;
+  }
+
+  await input.transport.handleRequest(input.request, input.response);
 }
 
 function registerGeneratedOperation(operation: OperationDefinition): void {
@@ -2489,6 +2570,39 @@ function extractSpotifyUrl(value: unknown): unknown {
   return typeof value === "object" && value !== null
     ? (value as Record<string, unknown>).spotify ?? null
     : null;
+}
+
+function normalizeTransportMode(value?: string): "stdio" | "http" {
+  return value?.trim().toLowerCase() === "http" ? "http" : "stdio";
+}
+
+function parseHttpPort(value?: string): number {
+  const parsed = Number(value ?? "3000");
+
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    throw new Error(`Invalid MCP_HTTP_PORT: ${value ?? ""}`);
+  }
+
+  return parsed;
+}
+
+function normalizeHttpPath(value?: string): string {
+  const candidate = value?.trim() || "/mcp";
+  const withLeadingSlash = candidate.startsWith("/") ? candidate : `/${candidate}`;
+
+  return withLeadingSlash === "/"
+    ? withLeadingSlash
+    : withLeadingSlash.replace(/\/+$/, "");
+}
+
+function sendJson(
+  response: ServerResponse<IncomingMessage>,
+  statusCode: number,
+  body: Record<string, unknown>,
+): void {
+  response.statusCode = statusCode;
+  response.setHeader("Content-Type", "application/json; charset=utf-8");
+  response.end(JSON.stringify(body, null, 2));
 }
 
 function loadDotenvFile(): void {
